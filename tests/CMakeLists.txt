@@ -1,5 +1,5 @@
 add_executable(SysRecordTests
-    app_state_tests.cpp
+    recording_config_tests.cpp
 )
 target_link_libraries(SysRecordTests PRIVATE
     Catch2::Catch2WithMain

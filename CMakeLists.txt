@@ -17,6 +17,7 @@ include(CTest)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(mp3lame CONFIG REQUIRED)
 
 if(BUILD_TESTING)
     find_package(Catch2 3 CONFIG REQUIRED)
@@ -36,11 +37,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(fltk)
 
 add_library(sys_record_core STATIC
-    src/app_state.cpp
+    src/audio/mp3_encoder.cpp
+    src/audio/recorder.cpp
+    src/config/recording_config.cpp
 )
 target_include_directories(sys_record_core PUBLIC src)
 target_link_libraries(sys_record_core PUBLIC
     nlohmann_json::nlohmann_json
+    mp3lame::mp3lame
 )
 
 add_executable(SysRecord WIN32

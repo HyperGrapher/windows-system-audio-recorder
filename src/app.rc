@@ -1,4 +1,5 @@
 #include <windows.h>
 
-101 ICON "../app_icon.ico"
-
+101 ICON "../resources/icon_idle.ico"
+102 ICON "../resources/icon_recording.ico"
+103 ICON "../resources/icon_paused.ico"
