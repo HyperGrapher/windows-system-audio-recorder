@@ -7,7 +7,9 @@ A compact Windows tray utility that captures whole-system output through WASAPI 
 - Tray controls for start/stop, pause/resume, output-folder access, startup registration, settings, and exit.
 - WASAPI loopback capture at the default output device's sample rate, with a bounded four-second PCM ring buffer.
 - Dedicated LAME encoder thread that incrementally writes the MP3 and flushes it on stop.
-- Compact dark settings window for the output folder, filename pattern, CBR bitrate, notifications, and launch-at-startup.
+- Compact dark settings window for the output folder, filename pattern, output device, CBR/VBR quality, silence/max-duration limits, hotkey, notifications, and launch-at-startup.
+- Selectable WASAPI render endpoint; selected-device reroutes are finalized safely and reported as errors.
+- Optional global start/stop hotkey, plus automatic stop after configurable silence or maximum duration.
 - UTF-8 JSON configuration under `%APPDATA%\SysRecord\config.json`.
 - Rotating application log under `%APPDATA%\SysRecord\logs` using spdlog.
 - Catch2 tests for configuration validation and filename formatting.

@@ -138,6 +138,10 @@ void saveConfig(const std::filesystem::path& path, const RecordingConfig& config
 
 std::string formatRecordingFilename(const std::string& pattern, const std::tm& localTime) {
     std::string filename = pattern.empty() ? std::string{kDefaultFilenamePattern} : pattern;
+    replaceAll(filename, "{yyyy-MM-dd}", std::to_string(localTime.tm_year + 1900) + "-" +
+                                             twoDigits(localTime.tm_mon + 1) + "-" + twoDigits(localTime.tm_mday));
+    replaceAll(filename, "{HH-mm-ss}", twoDigits(localTime.tm_hour) + "-" + twoDigits(localTime.tm_min) + "-" +
+                                         twoDigits(localTime.tm_sec));
     replaceAll(filename, "{yyyy}", std::to_string(localTime.tm_year + 1900));
     replaceAll(filename, "{MM}", twoDigits(localTime.tm_mon + 1));
     replaceAll(filename, "{dd}", twoDigits(localTime.tm_mday));

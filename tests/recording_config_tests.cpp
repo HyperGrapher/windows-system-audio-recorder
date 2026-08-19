@@ -55,3 +55,16 @@ TEST_CASE("filename patterns expand timestamps and cannot create nested paths") 
     REQUIRE(sysrecord::formatRecordingFilename("Capture/{yyyy}-{MM}-{dd}_{HH}-{mm}-{ss}", localTime) ==
             "Capture_2026-08-19_09-05-03.mp3");
 }
+
+TEST_CASE("the PRD default filename pattern expands its composite tokens") {
+    std::tm localTime{};
+    localTime.tm_year = 126;
+    localTime.tm_mon = 7;
+    localTime.tm_mday = 19;
+    localTime.tm_hour = 9;
+    localTime.tm_min = 5;
+    localTime.tm_sec = 3;
+
+    REQUIRE(sysrecord::formatRecordingFilename("SysRecord_{yyyy-MM-dd}_{HH-mm-ss}.mp3", localTime) ==
+            "SysRecord_2026-08-19_09-05-03.mp3");
+}

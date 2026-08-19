@@ -10,7 +10,7 @@ namespace sysrecord {
 class Mp3Encoder final {
 public:
     Mp3Encoder(const std::filesystem::path& outputPath, std::uint32_t sampleRate, std::uint32_t channels,
-               int bitrateKbps);
+               int bitrateKbps, bool vbrMode, int vbrQuality);
     ~Mp3Encoder();
 
     Mp3Encoder(const Mp3Encoder&) = delete;

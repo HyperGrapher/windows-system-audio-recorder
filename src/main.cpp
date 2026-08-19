@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -16,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -43,6 +46,7 @@ constexpr wchar_t kSingleInstanceName[] = L"Local\\SysRecord.SingleInstance";
 constexpr wchar_t kStartupRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kShowApplicationMessage = WM_APP + 2;
+constexpr int kGlobalHotkeyId = 1;
 constexpr UINT kToggleRecordingCommand = 1;
 constexpr UINT kTogglePauseCommand = 2;
 constexpr UINT kOpenFolderCommand = 3;
@@ -50,7 +54,7 @@ constexpr UINT kSettingsCommand = 4;
 constexpr UINT kStartupCommand = 5;
 constexpr UINT kExitCommand = 6;
 constexpr int kWindowWidth = 460;
-constexpr int kWindowHeight = 430;
+constexpr int kWindowHeight = 590;
 constexpr std::array kBitrates{128, 192, 256, 320};
 
 const Fl_Color kBackground = fl_rgb_color(30, 30, 30);
@@ -129,6 +133,7 @@ public:
     [[nodiscard]] bool create();
     void update(const TrayPresentation& presentation);
     void showNotification(const std::wstring& title, const std::wstring& message) const;
+    void setHotkey(UINT modifiers, UINT virtualKey);
 
 private:
     static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wordParameter, LPARAM longParameter);
@@ -143,7 +148,60 @@ private:
     bool ownsWindowClass_{};
     NOTIFYICONDATAW notification_{};
     TrayPresentation presentation_;
+    bool isHotkeyRegistered_{};
 };
+
+struct Hotkey {
+    UINT modifiers{};
+    UINT virtualKey{};
+};
+
+[[nodiscard]] Hotkey parseHotkey(const std::string& text) {
+    std::istringstream input{text};
+    std::string token;
+    Hotkey hotkey;
+    while (std::getline(input, token, '+')) {
+        std::transform(token.begin(), token.end(), token.begin(), [](const unsigned char character) {
+            return static_cast<char>(std::toupper(character));
+        });
+        if (token == "CTRL") {
+            hotkey.modifiers |= MOD_CONTROL;
+        } else if (token == "ALT") {
+            hotkey.modifiers |= MOD_ALT;
+        } else if (token == "SHIFT") {
+            hotkey.modifiers |= MOD_SHIFT;
+        } else if (token.size() == 1 && ((token[0] >= 'A' && token[0] <= 'Z') || (token[0] >= '0' && token[0] <= '9'))) {
+            if (hotkey.virtualKey != 0) {
+                throw std::invalid_argument("A hotkey can contain only one non-modifier key.");
+            }
+            hotkey.virtualKey = static_cast<UINT>(token[0]);
+        } else if (token.size() >= 2 && token[0] == 'F') {
+            const int functionNumber = std::stoi(token.substr(1));
+            if (functionNumber < 1 || functionNumber > 24 || hotkey.virtualKey != 0) {
+                throw std::invalid_argument("Use a letter, digit, or F1 through F24 for the hotkey.");
+            }
+            hotkey.virtualKey = VK_F1 + static_cast<UINT>(functionNumber - 1);
+        } else {
+            throw std::invalid_argument("Use a hotkey such as Ctrl+Alt+R.");
+        }
+    }
+    if (hotkey.virtualKey == 0) {
+        throw std::invalid_argument("Choose a non-modifier key for the hotkey.");
+    }
+    return hotkey;
+}
+
+[[nodiscard]] int parseBoundedInteger(const Fl_Input& input, const char* description, const int minimum,
+                                      const int maximum) {
+    const std::string_view text{input.value()};
+    int value{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value < minimum || value > maximum) {
+        throw std::invalid_argument(std::string{"Enter "} + description + " between " + std::to_string(minimum) +
+                                    " and " + std::to_string(maximum) + '.');
+    }
+    return value;
+}
 
 class InstanceMutex final {
 public:
@@ -326,10 +384,18 @@ public:
         if (config_.outputFolder.empty()) {
             config_.outputFolder = defaultConfig().outputFolder;
         }
+        refreshOutputDevices();
         sysrecord::saveConfig(configPath(), config_);
         buildUi();
         if (!tray_.create()) {
             throw std::runtime_error("Unable to create the notification-area icon.");
+        }
+        try {
+            configureHotkey(config_);
+        } catch (const std::exception& error) {
+            config_.hotkeyEnabled = false;
+            sysrecord::saveConfig(configPath(), config_);
+            spdlog::warn("The configured hotkey was disabled: {}", error.what());
         }
         updateUiAndTray(true);
         Fl::add_timeout(0.25, timerCallback, this);
@@ -428,29 +494,53 @@ private:
         filenamePatternInput_ = new Fl_Input(20, 219, 420, 30);
         styleInput(*filenamePatternInput_);
 
-        addLabel(20, 261, 100, 20, "MP3 bitrate", 11, kMuted, FL_HELVETICA_BOLD);
-        bitrateChoice_ = new Fl_Choice(20, 283, 130, 30);
+        addLabel(20, 261, 180, 20, "Output device", 11, kMuted, FL_HELVETICA_BOLD);
+        outputDeviceChoice_ = new Fl_Choice(20, 283, 420, 30);
+        outputDeviceChoice_->box(FL_BORDER_BOX);
+        outputDeviceChoice_->color(kInputBackground);
+        outputDeviceChoice_->textcolor(kText);
+
+        addLabel(20, 325, 100, 20, "MP3 bitrate", 11, kMuted, FL_HELVETICA_BOLD);
+        bitrateChoice_ = new Fl_Choice(20, 347, 130, 30);
         bitrateChoice_->add("128 kbps|192 kbps|256 kbps|320 kbps");
         bitrateChoice_->box(FL_BORDER_BOX);
         bitrateChoice_->color(kInputBackground);
         bitrateChoice_->textcolor(kText);
+        vbrCheck_ = new Fl_Check_Button(178, 346, 118, 32, "VBR mode");
+        vbrCheck_->labelcolor(kText);
+        vbrQualityChoice_ = new Fl_Choice(304, 347, 136, 30);
+        vbrQualityChoice_->add("VBR quality 0|VBR quality 1|VBR quality 2|VBR quality 3|VBR quality 4|VBR quality 5|VBR quality 6|VBR quality 7|VBR quality 8|VBR quality 9");
+        vbrQualityChoice_->box(FL_BORDER_BOX);
+        vbrQualityChoice_->color(kInputBackground);
+        vbrQualityChoice_->textcolor(kText);
 
-        notificationsCheck_ = new Fl_Check_Button(178, 282, 150, 32, "Notifications");
+        addLabel(20, 389, 150, 20, "Silence stop (seconds)", 11, kMuted, FL_HELVETICA_BOLD);
+        silenceTimeoutInput_ = new Fl_Input(20, 411, 130, 30);
+        styleInput(*silenceTimeoutInput_);
+        addLabel(178, 389, 150, 20, "Maximum duration (min)", 11, kMuted, FL_HELVETICA_BOLD);
+        maxDurationInput_ = new Fl_Input(178, 411, 130, 30);
+        styleInput(*maxDurationInput_);
+        notificationsCheck_ = new Fl_Check_Button(320, 410, 120, 32, "Notifications");
         notificationsCheck_->labelcolor(kText);
-        startupCheck_ = new Fl_Check_Button(328, 282, 112, 32, "Start with Windows");
+
+        hotkeyCheck_ = new Fl_Check_Button(20, 454, 110, 30, "Enable hotkey");
+        hotkeyCheck_->labelcolor(kText);
+        hotkeyInput_ = new Fl_Input(140, 454, 150, 30);
+        styleInput(*hotkeyInput_);
+        startupCheck_ = new Fl_Check_Button(308, 454, 132, 30, "Start with Windows");
         startupCheck_->labelcolor(kText);
 
-        auto* saveButton = new Fl_Button(20, 333, 130, 36, "Save settings");
+        auto* saveButton = new Fl_Button(20, 504, 130, 36, "Save settings");
         styleButton(*saveButton, kReady);
         saveButton->callback(saveCallback, this);
-        recordButton_ = new Fl_Button(160, 333, 170, 36, "Start recording");
+        recordButton_ = new Fl_Button(160, 504, 170, 36, "Start recording");
         styleButton(*recordButton_, kAccent);
         recordButton_->callback(toggleRecordingCallback, this);
-        pauseButton_ = new Fl_Button(340, 333, 100, 36, "Pause");
+        pauseButton_ = new Fl_Button(340, 504, 100, 36, "Pause");
         styleButton(*pauseButton_, kPanel);
         pauseButton_->callback(togglePauseCallback, this);
 
-        configPathLabel_ = addLabel(20, 385, 420, 28, "", 9, kMuted);
+        configPathLabel_ = addLabel(20, 550, 420, 28, "", 9, kMuted);
         window_->end();
         refreshSettingsControls();
     }
@@ -460,6 +550,22 @@ private:
         filenamePatternInput_->value(config_.filenamePattern.c_str());
         const auto bitrate = std::ranges::find(kBitrates, config_.bitrateKbps);
         bitrateChoice_->value(bitrate == kBitrates.end() ? 1 : static_cast<int>(bitrate - kBitrates.begin()));
+        outputDeviceChoice_->clear();
+        outputDeviceChoice_->add("System Default");
+        int selectedDeviceIndex = 0;
+        for (std::size_t index = 0; index < outputDevices_.size(); ++index) {
+            outputDeviceChoice_->add(outputDevices_[index].name.c_str());
+            if (outputDevices_[index].id == config_.outputDeviceId) {
+                selectedDeviceIndex = static_cast<int>(index + 1);
+            }
+        }
+        outputDeviceChoice_->value(selectedDeviceIndex);
+        vbrCheck_->value(config_.vbrMode ? 1 : 0);
+        vbrQualityChoice_->value(config_.vbrQuality);
+        silenceTimeoutInput_->value(std::to_string(config_.silenceTimeoutSeconds).c_str());
+        maxDurationInput_->value(std::to_string(config_.maxRecordingMinutes).c_str());
+        hotkeyCheck_->value(config_.hotkeyEnabled ? 1 : 0);
+        hotkeyInput_->value(config_.hotkey.c_str());
         notificationsCheck_->value(config_.showNotifications ? 1 : 0);
         startupCheck_->value(config_.launchAtStartup ? 1 : 0);
         const std::string configLocation = "Config: " + pathToUtf8(configPath());
@@ -474,6 +580,24 @@ private:
         if (chooser.show() == 0 && chooser.filename() != nullptr) {
             outputFolderInput_->value(chooser.filename());
         }
+    }
+
+    void refreshOutputDevices() {
+        try {
+            outputDevices_ = sysrecord::listOutputDevices();
+        } catch (const std::exception& error) {
+            outputDevices_.clear();
+            spdlog::warn("Unable to list output devices: {}", error.what());
+        }
+    }
+
+    void configureHotkey(const sysrecord::RecordingConfig& config) {
+        if (!config.hotkeyEnabled) {
+            tray_.setHotkey(0, 0);
+            return;
+        }
+        const Hotkey hotkey = parseHotkey(config.hotkey);
+        tray_.setHotkey(hotkey.modifiers, hotkey.virtualKey);
     }
 
     void saveSettings() {
@@ -492,6 +616,20 @@ private:
                 throw std::runtime_error("Choose an MP3 bitrate.");
             }
             updated.bitrateKbps = kBitrates[static_cast<std::size_t>(bitrateIndex)];
+            const int outputDeviceIndex = outputDeviceChoice_->value();
+            if (outputDeviceIndex < 0 || outputDeviceIndex > static_cast<int>(outputDevices_.size())) {
+                throw std::runtime_error("Choose an output device.");
+            }
+            updated.outputDeviceId = outputDeviceIndex == 0 ? "default" : outputDevices_[outputDeviceIndex - 1].id;
+            updated.vbrMode = vbrCheck_->value() != 0;
+            updated.vbrQuality = vbrQualityChoice_->value();
+            updated.silenceTimeoutSeconds = parseBoundedInteger(*silenceTimeoutInput_, "a silence timeout", 0, 3600);
+            updated.maxRecordingMinutes = parseBoundedInteger(*maxDurationInput_, "a maximum duration", 1, 300);
+            updated.hotkeyEnabled = hotkeyCheck_->value() != 0;
+            updated.hotkey = hotkeyInput_->value();
+            if (updated.hotkeyEnabled) {
+                static_cast<void>(parseHotkey(updated.hotkey));
+            }
             updated.showNotifications = notificationsCheck_->value() != 0;
             updated.launchAtStartup = startupCheck_->value() != 0;
 
@@ -502,6 +640,7 @@ private:
             if (updated.launchAtStartup != config_.launchAtStartup) {
                 setLaunchAtStartup(updated.launchAtStartup);
             }
+            configureHotkey(updated);
             sysrecord::saveConfig(configPath(), updated);
             config_ = std::move(updated);
             updateUiAndTray(true);
@@ -523,7 +662,11 @@ private:
     void startRecording() {
         try {
             const std::filesystem::path outputPath = uniqueOutputPath(config_);
-            recorder_.start(outputPath, config_.bitrateKbps);
+            recorder_.start(outputPath,
+                            {.bitrateKbps = config_.bitrateKbps,
+                             .vbrMode = config_.vbrMode,
+                             .vbrQuality = config_.vbrQuality,
+                             .outputDeviceId = config_.outputDeviceId});
             spdlog::info("Recording started: {}", pathToUtf8(outputPath));
             if (config_.showNotifications) {
                 tray_.showNotification(L"Recording started", outputPath.filename().wstring());
@@ -572,6 +715,14 @@ private:
         }
         if ((status.state == sysrecord::RecorderState::Recording || status.state == sysrecord::RecorderState::Paused) &&
             status.elapsed >= std::chrono::minutes{config_.maxRecordingMinutes}) {
+            stopRecording();
+            return;
+        }
+        if (status.state == sysrecord::RecorderState::Recording && config_.silenceTimeoutSeconds > 0 &&
+            status.silenceElapsed >= std::chrono::seconds{config_.silenceTimeoutSeconds}) {
+            if (config_.showNotifications) {
+                tray_.showNotification(L"Recording stopped", L"No audible system audio was detected.");
+            }
             stopRecording();
             return;
         }
@@ -733,6 +884,7 @@ private:
 
     std::filesystem::path dataDirectory_;
     sysrecord::RecordingConfig config_;
+    std::vector<sysrecord::OutputDevice> outputDevices_;
     sysrecord::Recorder recorder_;
     TrayIcon tray_;
     std::unique_ptr<Fl_Double_Window> window_;
@@ -743,7 +895,14 @@ private:
     Fl_Box* configPathLabel_{};
     Fl_Input* outputFolderInput_{};
     Fl_Input* filenamePatternInput_{};
+    Fl_Choice* outputDeviceChoice_{};
     Fl_Choice* bitrateChoice_{};
+    Fl_Check_Button* vbrCheck_{};
+    Fl_Choice* vbrQualityChoice_{};
+    Fl_Input* silenceTimeoutInput_{};
+    Fl_Input* maxDurationInput_{};
+    Fl_Check_Button* hotkeyCheck_{};
+    Fl_Input* hotkeyInput_{};
     Fl_Check_Button* notificationsCheck_{};
     Fl_Check_Button* startupCheck_{};
     Fl_Button* recordButton_{};
@@ -816,7 +975,25 @@ void TrayIcon::showNotification(const std::wstring& title, const std::wstring& m
     Shell_NotifyIconW(NIM_MODIFY, &notification);
 }
 
+void TrayIcon::setHotkey(const UINT modifiers, const UINT virtualKey) {
+    if (isHotkeyRegistered_) {
+        UnregisterHotKey(window_, kGlobalHotkeyId);
+        isHotkeyRegistered_ = false;
+    }
+    if (virtualKey == 0) {
+        return;
+    }
+    if (RegisterHotKey(window_, kGlobalHotkeyId, modifiers | MOD_NOREPEAT, virtualKey) == FALSE) {
+        throw std::runtime_error("Windows could not register that hotkey. It may already be in use.");
+    }
+    isHotkeyRegistered_ = true;
+}
+
 void TrayIcon::remove() {
+    if (isHotkeyRegistered_ && window_ != nullptr) {
+        UnregisterHotKey(window_, kGlobalHotkeyId);
+        isHotkeyRegistered_ = false;
+    }
     if (window_ != nullptr) {
         Shell_NotifyIconW(NIM_DELETE, &notification_);
         DestroyWindow(window_);
@@ -861,7 +1038,10 @@ LRESULT CALLBACK TrayIcon::windowProcedure(HWND window, const UINT message, cons
 
 LRESULT TrayIcon::handleMessage(HWND window, const UINT message, const WPARAM wordParameter,
                                 const LPARAM longParameter) {
-    static_cast<void>(wordParameter);
+    if (message == WM_HOTKEY && wordParameter == kGlobalHotkeyId) {
+        callback_(TrayCommand::ToggleRecording);
+        return 0;
+    }
     if (message == kShowApplicationMessage) {
         callback_(TrayCommand::Settings);
         return 0;

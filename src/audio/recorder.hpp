@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace sysrecord {
 
@@ -19,10 +20,25 @@ struct RecorderStatus {
     RecorderState state{RecorderState::Idle};
     std::filesystem::path outputPath;
     std::chrono::milliseconds elapsed{};
+    std::chrono::milliseconds silenceElapsed{};
     std::uint64_t bytesWritten{};
     std::uint64_t droppedFrames{};
     std::string errorMessage;
 };
+
+struct RecorderSettings {
+    int bitrateKbps{192};
+    bool vbrMode{false};
+    int vbrQuality{4};
+    std::string outputDeviceId{"default"};
+};
+
+struct OutputDevice {
+    std::string id;
+    std::string name;
+};
+
+[[nodiscard]] std::vector<OutputDevice> listOutputDevices();
 
 class Recorder final {
 public:
@@ -32,7 +48,7 @@ public:
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
 
-    void start(const std::filesystem::path& outputPath, int bitrateKbps);
+    void start(const std::filesystem::path& outputPath, const RecorderSettings& settings);
     void stop();
     void pause();
     void resume();

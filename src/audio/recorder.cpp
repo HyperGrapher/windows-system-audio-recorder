@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <thread>
 
 #define NOMINMAX
+#include <windows.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include <miniaudio.h>
 
@@ -24,12 +26,79 @@ namespace {
 constexpr ma_uint32 kCaptureChannels = 2;
 constexpr ma_uint32 kRingBufferSeconds = 4;
 constexpr ma_uint32 kEncoderChunkFrames = 9216;
+constexpr float kSilenceThreshold = 0.003F;
 
 [[nodiscard]] std::runtime_error miniaudioError(const char* operation, const ma_result result) {
     return std::runtime_error(std::string{operation} + ": " + ma_result_description(result));
 }
 
+[[nodiscard]] std::wstring utf8ToWide(const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+                                         nullptr, 0);
+    if (size <= 0) {
+        throw std::invalid_argument("The selected output-device ID is not valid UTF-8.");
+    }
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(),
+                        size);
+    return result;
+}
+
+[[nodiscard]] std::string wideToUtf8(const std::wstring& value) {
+    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr,
+                                         nullptr);
+    if (size <= 0) {
+        throw std::runtime_error("Unable to encode an output-device ID as UTF-8.");
+    }
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr,
+                        nullptr);
+    return result;
+}
+
+[[nodiscard]] ma_device_id deviceIdFromUtf8(const std::string& value) {
+    const std::wstring wideValue = utf8ToWide(value);
+    ma_device_id result{};
+    if (wideValue.size() >= std::size(result.wasapi)) {
+        throw std::invalid_argument("The selected output-device ID is too long.");
+    }
+    std::copy(wideValue.begin(), wideValue.end(), result.wasapi);
+    result.wasapi[wideValue.size()] = L'\0';
+    return result;
+}
+
 }  // namespace
+
+std::vector<OutputDevice> listOutputDevices() {
+    constexpr ma_backend backends[]{ma_backend_wasapi};
+    ma_context context{};
+    const ma_result contextResult =
+        ma_context_init(backends, static_cast<ma_uint32>(std::size(backends)), nullptr, &context);
+    if (contextResult != MA_SUCCESS) {
+        throw miniaudioError("Unable to enumerate WASAPI output devices", contextResult);
+    }
+
+    ma_device_info* playbackDevices = nullptr;
+    ma_uint32 playbackDeviceCount = 0;
+    const ma_result devicesResult =
+        ma_context_get_devices(&context, &playbackDevices, &playbackDeviceCount, nullptr, nullptr);
+    if (devicesResult != MA_SUCCESS) {
+        ma_context_uninit(&context);
+        throw miniaudioError("Unable to enumerate WASAPI output devices", devicesResult);
+    }
+
+    std::vector<OutputDevice> devices;
+    devices.reserve(playbackDeviceCount);
+    for (ma_uint32 index = 0; index < playbackDeviceCount; ++index) {
+        const ma_device_info& device = playbackDevices[index];
+        devices.push_back({wideToUtf8(std::wstring{device.id.wasapi}), device.name});
+    }
+    ma_context_uninit(&context);
+    return devices;
+}
 
 class Recorder::Impl final {
 public:
@@ -40,7 +109,7 @@ public:
         }
     }
 
-    void start(const std::filesystem::path& outputPath, const int bitrateKbps) {
+    void start(const std::filesystem::path& outputPath, const RecorderSettings& settings) {
         std::unique_lock stateLock{stateMutex_};
         if (state_ != RecorderState::Idle) {
             throw std::logic_error("A recording is already active.");
@@ -58,7 +127,17 @@ public:
         deviceConfig.capture.channels = kCaptureChannels;
         deviceConfig.sampleRate = 0;
         deviceConfig.dataCallback = dataCallback;
+        deviceConfig.notificationCallback = notificationCallback;
         deviceConfig.pUserData = this;
+
+        ma_device_id selectedDevice{};
+        const bool isUsingDefaultDevice = settings.outputDeviceId == "default";
+        if (!isUsingDefaultDevice) {
+            selectedDevice = deviceIdFromUtf8(settings.outputDeviceId);
+            deviceConfig.capture.pDeviceID = &selectedDevice;
+        }
+        isUsingDefaultDevice_ = isUsingDefaultDevice;
+        deviceWasRerouted_.store(false, std::memory_order_release);
 
         constexpr ma_backend backends[]{ma_backend_wasapi};
         const ma_result deviceResult =
@@ -85,7 +164,8 @@ public:
             isRingBufferInitialized_ = true;
 
             encoder_ =
-                std::make_unique<Mp3Encoder>(outputPath, device_.sampleRate, device_.capture.channels, bitrateKbps);
+                std::make_unique<Mp3Encoder>(outputPath, device_.sampleRate, device_.capture.channels,
+                                             settings.bitrateKbps, settings.vbrMode, settings.vbrQuality);
             encoderThread_ = std::thread{[this] { encodeLoop(); }};
 
             const ma_result startResult = ma_device_start(&device_);
@@ -94,6 +174,9 @@ public:
             }
             isDeviceStarted_ = true;
             startedAt_ = std::chrono::steady_clock::now();
+            lastAudibleAtMilliseconds_.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(startedAt_.time_since_epoch()).count(),
+                std::memory_order_relaxed);
             pausedDuration_ = std::chrono::steady_clock::duration::zero();
             state_ = RecorderState::Recording;
         } catch (...) {
@@ -138,6 +221,9 @@ public:
         }
         if (stopError.empty()) {
             stopError = errorMessage_;
+        }
+        if (stopError.empty() && deviceWasRerouted_.load(std::memory_order_acquire)) {
+            stopError = "The selected output device changed or became unavailable.";
         }
         releaseResources();
         state_ = RecorderState::Idle;
@@ -186,12 +272,24 @@ public:
         current.droppedFrames = droppedFrames_.load(std::memory_order_relaxed);
         current.errorMessage = errorMessage_;
 
+        if (deviceWasRerouted_.load(std::memory_order_acquire) && state_ != RecorderState::Idle) {
+            current.state = RecorderState::Error;
+            current.errorMessage = "The selected output device changed or became unavailable.";
+        }
+
         if (state_ == RecorderState::Recording) {
             current.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - startedAt_ - pausedDuration_);
         } else if (state_ == RecorderState::Paused) {
             current.elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(pausedAt_ - startedAt_ - pausedDuration_);
+        }
+        if (state_ == RecorderState::Recording) {
+            const auto nowMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count();
+            const auto audibleMilliseconds = lastAudibleAtMilliseconds_.load(std::memory_order_relaxed);
+            current.silenceElapsed = std::chrono::milliseconds{std::max<std::int64_t>(0, nowMilliseconds - audibleMilliseconds)};
         }
         return current;
     }
@@ -202,9 +300,28 @@ private:
         recorder->writeCapturedFrames(inputFrames, frameCount);
     }
 
+    static void notificationCallback(const ma_device_notification* notification) {
+        auto* recorder = static_cast<Impl*>(notification->pDevice->pUserData);
+        if (notification->type == ma_device_notification_type_rerouted && !recorder->isUsingDefaultDevice_) {
+            recorder->deviceWasRerouted_.store(true, std::memory_order_release);
+        }
+    }
+
     void writeCapturedFrames(const void* inputFrames, const ma_uint32 frameCount) {
         ma_uint32 remainingFrames = frameCount;
         const auto* source = static_cast<const float*>(inputFrames);
+        if (source != nullptr) {
+            const std::size_t sampleCount = static_cast<std::size_t>(frameCount) * device_.capture.channels;
+            const bool hasAudibleSample = std::ranges::any_of(std::span{source, sampleCount}, [](const float sample) {
+                return std::abs(sample) >= kSilenceThreshold;
+            });
+            if (hasAudibleSample) {
+                lastAudibleAtMilliseconds_.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
+            }
+        }
         while (remainingFrames > 0) {
             ma_uint32 framesToWrite = remainingFrames;
             void* destination = nullptr;
@@ -311,6 +428,8 @@ private:
     std::atomic<bool> stopRequested_{};
     std::atomic<std::uint64_t> bytesWritten_{};
     std::atomic<std::uint64_t> droppedFrames_{};
+    std::atomic<std::int64_t> lastAudibleAtMilliseconds_{};
+    std::atomic<bool> deviceWasRerouted_{};
     std::filesystem::path outputPath_;
     std::string errorMessage_;
     std::chrono::steady_clock::time_point startedAt_{};
@@ -320,14 +439,15 @@ private:
     bool isDeviceInitialized_{};
     bool isRingBufferInitialized_{};
     bool isDeviceStarted_{};
+    bool isUsingDefaultDevice_{true};
 };
 
 Recorder::Recorder() : impl_(std::make_unique<Impl>()) {}
 
 Recorder::~Recorder() = default;
 
-void Recorder::start(const std::filesystem::path& outputPath, const int bitrateKbps) {
-    impl_->start(outputPath, bitrateKbps);
+void Recorder::start(const std::filesystem::path& outputPath, const RecorderSettings& settings) {
+    impl_->start(outputPath, settings);
 }
 
 void Recorder::stop() {
